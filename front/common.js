@@ -1375,14 +1375,32 @@ async function processAntigravityCallbackUrl() {
             body: JSON.stringify({ callback_url: callbackUrl, mode: 'antigravity' })
         });
 
-        const result = await response.json();
+        // 无论状态码如何都尝试解析 JSON，把后端 detail 透传到 UI，避免只见 400 看不到原因
+        let result = null;
+        let rawText = '';
+        try {
+            rawText = await response.text();
+            if (rawText) {
+                result = JSON.parse(rawText);
+            }
+        } catch (e) {
+            console.error('Antigravity callback-url 响应不是JSON:', rawText, 'status:', response.status);
+        }
 
-        if (result.credentials) {
+        if (!response.ok) {
+            const detail = (result && (result.error || result.detail)) || `HTTP ${response.status} ${rawText || '(空响应)'}`.trim();
+            console.error(`Antigravity callback-url 失败 (${response.status}):`, detail);
+            showStatus(`Antigravity 认证失败 (${response.status}): ${detail}`, 'error');
+            document.getElementById('antigravityCallbackUrlInput').value = '';
+            return;
+        }
+
+        if (result && result.credentials) {
             showStatus(result.message || '从回调URL获取 Antigravity 凭证成功！', 'success');
             document.getElementById('antigravityCredsContent').textContent = JSON.stringify(result.credentials, null, 2);
             document.getElementById('antigravityCredsSection').classList.remove('hidden');
         } else {
-            showStatus(result.error || '从回调URL获取 Antigravity 凭证失败', 'error');
+            showStatus((result && result.error) || '从回调URL获取 Antigravity 凭证失败', 'error');
         }
 
         document.getElementById('antigravityCallbackUrlInput').value = '';

@@ -32,9 +32,15 @@ from .utils import (
     CALLBACK_HOST,
     CLIENT_ID,
     CLIENT_SECRET,
+    GEMINICLI_USER_AGENT,
     SCOPES,
     TOKEN_URL,
 )
+
+
+# OAuth 换 token 请求的 User-Agent：对齐官方 Antigravity 原生客户端形态，
+# Google 会对该企业级 OAuth 客户端做客户端身份校验，缺失/不符 UA 会导致换码 400
+ANTIGRAVITY_OAUTH_USER_AGENT = "vscode/1.87.2 (Antigravity/2.15.8)"
 
 
 async def get_callback_port():
@@ -273,6 +279,9 @@ async def create_auth_url(
             client_secret=client_secret,
             scopes=scopes,
             redirect_uri=callback_url,
+            user_agent=(
+                ANTIGRAVITY_OAUTH_USER_AGENT if mode == "antigravity" else GEMINICLI_USER_AGENT
+            ),
         )
 
         # 生成状态标识符，包含用户会话信息
@@ -789,9 +798,14 @@ async def complete_auth_flow_from_callback_url(
 
         # 检查是否有对应的认证流程
         if state not in auth_flows:
+            log.warning(f"未找到对应的认证流程 (state: {state})，可能原因：未先在本面板启动认证/超过30分钟过期/服务重启")
             return {
                 "success": False,
-                "error": f"未找到对应的认证流程，请先启动认证 (state: {state})",
+                "error": (
+                    f"未找到对应的认证流程 (state: {state})。"
+                    "请确认：1) 是在本面板点击『获取认证链接』后完成的授权；"
+                    "2) 授权后 30 分钟内粘贴；3) 面板服务未重启过。"
+                ),
             }
 
         flow_data = auth_flows[state]
@@ -986,7 +1000,7 @@ def async_shutdown_server(server, port):
 def cleanup_expired_flows():
     """清理过期的认证流程"""
     current_time = time.time()
-    EXPIRY_TIME = 600  # 10分钟过期
+    EXPIRY_TIME = 1800  # 30分钟过期（放宽：避免用户在授权页停留稍久即丢失 state）
 
     # 直接遍历删除，避免创建额外列表
     states_to_remove = [

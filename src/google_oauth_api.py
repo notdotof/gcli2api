@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
+import httpx
 import jwt
 
 from config import (
@@ -27,6 +28,22 @@ class TokenError(Exception):
     pass
 
 
+# 默认 OAuth 换 token 请求的 User-Agent（未指定时兜底）
+DEFAULT_OAUTH_USER_AGENT = "GeminiCLI/0.1.5 (Windows; AMD64)"
+
+
+def _format_token_error(prefix: str, e: Exception) -> str:
+    """把异常格式化成可诊断的错误消息，尽量保留 Google 返回的错误详情"""
+    if isinstance(e, httpx.HTTPStatusError):
+        status = e.response.status_code
+        body = e.response.text.strip()
+        return f"{prefix} (HTTP {status}): {body or e}"
+    if hasattr(e, "response") and hasattr(e.response, "status_code"):
+        status = e.response.status_code
+        return f"{prefix} (HTTP {status}): {e}"
+    return f"{prefix}: {e}"
+
+
 class Credentials:
     """凭证类"""
 
@@ -38,6 +55,7 @@ class Credentials:
         client_secret: str = None,
         expires_at: datetime = None,
         project_id: str = None,
+        user_agent: str = None,
     ):
         self.access_token = access_token
         self.refresh_token = refresh_token
@@ -45,6 +63,7 @@ class Credentials:
         self.client_secret = client_secret
         self.expires_at = expires_at
         self.project_id = project_id
+        self.user_agent = user_agent or DEFAULT_OAUTH_USER_AGENT
 
         # 反代配置将在使用时异步获取
         self.oauth_base_url = None
@@ -88,7 +107,10 @@ class Credentials:
             response = await post_async(
                 token_url,
                 data=data,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": self.user_agent,
+                },
             )
             response.raise_for_status()
 
@@ -111,17 +133,12 @@ class Credentials:
             log.debug(f"Token刷新成功，过期时间: {self.expires_at}")
 
         except Exception as e:
-            error_msg = str(e)
-            status_code = None
-            if hasattr(e, 'response') and hasattr(e.response, 'status_code'):
-                status_code = e.response.status_code
-                error_msg = f"Token刷新失败 (HTTP {status_code}): {error_msg}"
-            else:
-                error_msg = f"Token刷新失败: {error_msg}"
-
+            error_msg = _format_token_error("Token刷新失败", e)
             log.error(error_msg)
             token_error = TokenError(error_msg)
-            token_error.status_code = status_code
+            token_error.status_code = e.response.status_code if isinstance(
+                e, httpx.HTTPStatusError
+            ) else getattr(getattr(e, "response", None), "status_code", None)
             raise token_error
 
     @classmethod
@@ -149,6 +166,7 @@ class Credentials:
             client_secret=data.get("client_secret"),
             expires_at=expires_at,
             project_id=data.get("project_id"),
+            user_agent=data.get("user_agent"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -171,12 +189,18 @@ class Flow:
     """OAuth流程类"""
 
     def __init__(
-        self, client_id: str, client_secret: str, scopes: List[str], redirect_uri: str = None
+        self,
+        client_id: str,
+        client_secret: str,
+        scopes: List[str],
+        redirect_uri: str = None,
+        user_agent: str = None,
     ):
         self.client_id = client_id
         self.client_secret = client_secret
         self.scopes = scopes
         self.redirect_uri = redirect_uri
+        self.user_agent = user_agent or DEFAULT_OAUTH_USER_AGENT
 
         # 反代配置将在使用时异步获取
         self.oauth_base_url = None
@@ -217,7 +241,12 @@ class Flow:
             oauth_base_url = await get_oauth_proxy_url()
             token_url = f"{oauth_base_url.rstrip('/')}/token"
             response = await post_async(
-                token_url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"}
+                token_url,
+                data=data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": self.user_agent,
+                },
             )
             response.raise_for_status()
 
@@ -236,12 +265,13 @@ class Flow:
                 client_id=self.client_id,
                 client_secret=self.client_secret,
                 expires_at=expires_at,
+                user_agent=self.user_agent,
             )
 
             return self.credentials
 
         except Exception as e:
-            error_msg = f"获取token失败: {str(e)}"
+            error_msg = _format_token_error("获取token失败", e)
             log.error(error_msg)
             raise TokenError(error_msg)
 
