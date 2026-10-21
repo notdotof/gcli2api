@@ -21,6 +21,13 @@ jobs:
 
       - name: Update version.txt
         run: |
+          # 检查是否为 merge commit，如果是则保留上游 version.txt
+          PARENT_COUNT=$(git rev-parse HEAD^@ | wc -l)
+          if [ "$PARENT_COUNT" -gt 1 ]; then
+            echo "Merge commit detected, keeping upstream version.txt"
+            exit 0
+          fi
+
           # 获取最新commit信息
           FULL_HASH=$(git log -1 --format=%H)
           SHORT_HASH=$(git log -1 --format=%h)
