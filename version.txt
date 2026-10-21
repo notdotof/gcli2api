@@ -1,4 +1,4 @@
-full_hash=947642f619a4c66d19813782c66f66cc43803acc
-short_hash=947642f
-message=fix(version): sync version.txt with upstream and prevent merge commits from overwriting it
-date=2026-10-21 13:38:29 +0000
+full_hash=c597643c1aba49a53493d75734d86bab54f9aae1
+short_hash=c597643
+message=Update antigravity_fix.py
+date=2026-10-16 10:32:23 +0800
