@@ -6,6 +6,8 @@ Centralizes all configuration to avoid duplication across modules.
 - 修改配置时调用 reload_config() 重新从数据库加载
 """
 
+import ipaddress
+import json
 import os
 import re
 from typing import Any, Optional
@@ -41,6 +43,10 @@ ENV_MAPPINGS = {
     "RETURN_THOUGHTS_TO_FRONTEND": "return_thoughts_to_frontend",
     "SENSITIVE_WORDS": "sensitive_words",
     "SENSITIVE_WORDS_ENABLED": "sensitive_words_enabled",
+    "IP_WHITELIST": "ip_whitelist",
+    "IP_WHITELIST_ENABLED": "ip_whitelist_enabled",
+    "MODEL_REWRITE_ENABLED": "model_rewrite_enabled",
+    "MODEL_REWRITE_RULES": "model_rewrite_rules",
     "USAGE_LOG_ENABLED": "usage_log_enabled",
     "CREDENTIAL_SELECT_MODE": "credential_select_mode",
     "HOST": "host",
@@ -305,13 +311,13 @@ async def get_sensitive_words_enabled() -> bool:
 
     Environment variable: SENSITIVE_WORDS_ENABLED
     Database config key: sensitive_words_enabled
-    Default: True
+    Default: False
     """
     env_value = os.getenv("SENSITIVE_WORDS_ENABLED")
     if env_value:
         return env_value.lower() in ("true", "1", "yes", "on")
 
-    return bool(await get_config_value("sensitive_words_enabled", True))
+    return bool(await get_config_value("sensitive_words_enabled", False))
 
 
 async def get_sensitive_words() -> list:
@@ -386,6 +392,272 @@ async def get_sensitive_word_filter():
     if not words:
         return False, []
     return True, compile_sensitive_words(words)
+
+
+# ====================== IP 白名单 ======================
+
+# IP 白名单规则缓存: (原始条目指纹, 解析结果 (rules, invalid))
+_ip_whitelist_cache: dict = {"fingerprint": None, "result": ([], [])}
+
+
+def parse_ip_whitelist_line(line: str):
+    """
+    解析单条白名单条目为 (lo, hi, version) 网络对象；无效时抛出 ValueError。
+
+    支持格式（IPv4 / IPv6）：
+    - 单个 IP: 192.168.1.1 / ::1
+    - CIDR 网段: 192.168.1.0/24 / 2001:db8::/32
+    - IP 起止范围（- 或 ~ 分隔）: 192.168.1.1-192.168.1.100 / ::1-::10
+    """
+    line = str(line).strip()
+    if not line:
+        raise ValueError("空条目")
+
+    for sep in ("~", "-"):
+        if sep in line:
+            start_str, _, end_str = line.partition(sep)
+            if start_str.strip() and end_str.strip():
+                start = ipaddress.ip_address(start_str.strip())
+                end = ipaddress.ip_address(end_str.strip())
+                if start.version != end.version:
+                    raise ValueError(f"起止 IP 版本不一致: {line}")
+                if int(start) > int(end):
+                    start, end = end, start
+                return start, end, start.version
+
+    if "/" in line:
+        net = ipaddress.ip_network(line, strict=False)
+        return net.network_address, net.broadcast_address, net.version
+
+    addr = ipaddress.ip_address(line)
+    return addr, addr, addr.version
+
+
+def compile_ip_whitelist(entries: list):
+    """
+    解析白名单条目列表为规则列表（带缓存）。
+
+    Returns:
+        (rules, invalid)——rules 为 [(lo, hi, version), ...]，invalid 为解析失败的原始条目。
+    """
+    fingerprint = tuple(str(e) for e in entries)
+    if _ip_whitelist_cache["fingerprint"] == fingerprint:
+        return _ip_whitelist_cache["result"]
+
+    rules = []
+    invalid = []
+    for entry in entries:
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        try:
+            rules.append(parse_ip_whitelist_line(entry))
+        except ValueError:
+            invalid.append(entry)
+
+    result = (rules, invalid)
+    _ip_whitelist_cache["fingerprint"] = fingerprint
+    _ip_whitelist_cache["result"] = result
+    return result
+
+
+def ip_in_whitelist(client_ip: str, rules: list) -> bool:
+    """判断客户端 IP 是否命中白名单规则（IPv4/IPv6 均支持）"""
+    if not client_ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    return any(lo.version == addr.version and lo <= addr <= hi for lo, hi, _ in rules)
+
+
+async def get_ip_whitelist_enabled() -> bool:
+    """
+    IP 白名单开关。
+
+    Environment variable: IP_WHITELIST_ENABLED
+    Database config key: ip_whitelist_enabled
+    Default: False
+    """
+    env_value = os.getenv("IP_WHITELIST_ENABLED")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+
+    return bool(await get_config_value("ip_whitelist_enabled", False))
+
+
+async def get_ip_whitelist() -> list:
+    """
+    IP 白名单列表，每行一条；空列表表示不限制。
+
+    支持单个 IP、CIDR 网段、起止范围（- 或 ~ 分隔），IPv4/IPv6 均可。
+    仅在开关开启时生效，命中白名单以外 IP 的所有请求（面板 + API）将直接返回 403。
+
+    Environment variable: IP_WHITELIST (逗号或换行分隔)
+    Database config key: ip_whitelist
+    Default: []
+    """
+    env_value = os.getenv("IP_WHITELIST")
+    if env_value is not None and env_value.strip():
+        return [e.strip() for e in re.split(r"[,\n]", env_value) if e.strip()]
+
+    value = await get_config_value("ip_whitelist")
+    if isinstance(value, list):
+        return [str(e).strip() for e in value if str(e).strip()]
+    if isinstance(value, str) and value.strip():
+        return [e.strip() for e in re.split(r"[,\n]", value) if e.strip()]
+    return []
+
+
+async def get_ip_whitelist_rules():
+    """
+    获取生效的 IP 白名单规则（供请求拦截中间件调用）。
+
+    Returns:
+        (enabled, rules)；开关关闭或白名单为空时不启用限制。
+    """
+    if not await get_ip_whitelist_enabled():
+        return False, []
+    entries = await get_ip_whitelist()
+    if not entries:
+        return False, []
+    rules, invalid = compile_ip_whitelist(entries)
+    if invalid:
+        log.warning(f"IP 白名单中存在无效条目（已跳过）: {invalid}")
+    return bool(rules), rules
+
+
+# ====================== 模型名复写 ======================
+
+# 模型名复写规则缓存: (指纹, (编译后的规则列表, 无效规则列表))
+_model_rewrite_cache: dict = {"fingerprint": None, "result": ([], [])}
+
+
+async def get_model_rewrite_enabled() -> bool:
+    """
+    模型名复写开关。
+
+    Environment variable: MODEL_REWRITE_ENABLED
+    Database config key: model_rewrite_enabled
+    Default: False
+    """
+    env_value = os.getenv("MODEL_REWRITE_ENABLED")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+
+    return bool(await get_config_value("model_rewrite_enabled", False))
+
+
+async def get_model_rewrite_rules_config() -> list:
+    """
+    模型名复写规则列表，每条为 [pattern, replacement]。
+
+    pattern 支持正则（对模型名做全匹配搜索，命中任意一处即替换），
+    replacement 中可使用正则反向引用（如 \\1）。
+
+    Environment variable: MODEL_REWRITE_RULES (JSON 数组，如 [["gpt-4","gemini-2.5-pro"]]；也支持 "pat->rep" 逗号分隔的简化格式)
+    Database config key: model_rewrite_rules
+    Default: []
+    """
+    env_value = os.getenv("MODEL_REWRITE_RULES")
+    if env_value is not None and env_value.strip():
+        parsed = _parse_model_rewrite_rules_value(env_value)
+        if parsed is not None:
+            return parsed
+
+    value = await get_config_value("model_rewrite_rules")
+    return _parse_model_rewrite_rules_value(value) or []
+
+
+def _parse_model_rewrite_rules_value(value: Any) -> Optional[list]:
+    """将配置值解析为 [[pattern, replacement], ...]；无法解析时返回 None"""
+    if isinstance(value, list):
+        rules = []
+        for item in value:
+            if isinstance(item, (list, tuple)) and len(item) == 2 and all(isinstance(x, str) for x in item):
+                rules.append([item[0], item[1]])
+            elif isinstance(item, dict) and isinstance(item.get("pattern"), str) and isinstance(item.get("replacement"), str):
+                rules.append([item["pattern"], item["replacement"]])
+        return rules
+    if isinstance(value, str) and value.strip():
+        # 优先尝试 JSON 数组格式（环境变量推荐格式）
+        if value.strip().startswith("["):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    inner = _parse_model_rewrite_rules_value(parsed)
+                    if inner is not None:
+                        return inner
+            except (json.JSONDecodeError, ValueError):
+                pass
+        # 兼容 "pat->rep,pat->rep" 简化格式
+        rules = []
+        for pair in value.split(","):
+            pair = pair.strip()
+            if "->" in pair:
+                pat, _, rep = pair.partition("->")
+                rules.append([pat.strip(), rep.strip()])
+        return rules or None
+    return None
+
+
+def compile_model_rewrite_rules(rules: list):
+    """
+    编译复写规则为 (pattern, replacement) 元组列表（带缓存）。
+
+    Returns:
+        (compiled, invalid)——invalid 为编译失败的原始规则。
+    """
+    fingerprint = tuple(tuple(r) for r in rules)
+    if _model_rewrite_cache["fingerprint"] == fingerprint:
+        return _model_rewrite_cache["result"]
+
+    compiled = []
+    invalid = []
+    for rule in rules:
+        if not (isinstance(rule, (list, tuple)) and len(rule) == 2):
+            continue
+        pattern, replacement = rule[0], rule[1]
+        try:
+            compiled.append((re.compile(str(pattern)), str(replacement)))
+        except re.error:
+            invalid.append(rule)
+
+    result = (compiled, invalid)
+    _model_rewrite_cache["fingerprint"] = fingerprint
+    _model_rewrite_cache["result"] = result
+    return result
+
+
+def rewrite_model_name(model_name: str, compiled_rules: list) -> str:
+    """
+    按规则顺序应用模型名复写（命中第一条即停止）。
+
+    使用 re.sub 全字符串搜索替换；replacement 支持 \\1 等反向引用。
+    """
+    for pattern, replacement in compiled_rules:
+        if pattern.search(model_name):
+            return pattern.sub(replacement, model_name)
+    return model_name
+
+
+async def get_model_rewrite_filter():
+    """
+    获取生效的模型名复写规则（供请求处理管道调用）。
+
+    Returns:
+        (enabled, compiled_rules)；未启用时 compiled_rules 为空列表。
+    """
+    if not await get_model_rewrite_enabled():
+        return False, []
+    rules = await get_model_rewrite_rules_config()
+    if not rules:
+        return False, []
+    compiled, invalid = compile_model_rewrite_rules(rules)
+    if invalid:
+        log.warning(f"模型名复写规则中存在无效正则（已跳过）: {invalid}")
+    return bool(compiled), compiled
 
 
 # ====================== 请求日志 ======================

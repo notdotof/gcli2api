@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from log import log
@@ -20,7 +21,6 @@ from src.router.antigravity.openai import router as antigravity_openai_router
 from src.router.antigravity.gemini import router as antigravity_gemini_router
 from src.router.antigravity.anthropic import router as antigravity_anthropic_router
 from src.router.antigravity.model_list import router as antigravity_model_list_router
-from src.task_manager import shutdown_all_tasks
 from src.panel import router as panel_router
 
 
@@ -65,13 +65,6 @@ async def lifespan(app: FastAPI):
     # 清理资源
     log.info("开始关闭 AGY2API 主服务")
 
-    # 首先关闭所有异步任务
-    try:
-        await shutdown_all_tasks(timeout=10.0)
-        log.info("所有异步任务已关闭")
-    except Exception as e:
-        log.error(f"关闭异步任务时出错: {e}")
-
     # 关闭凭证管理器与数据库
     try:
         from src.storage.database import close_database
@@ -90,6 +83,52 @@ async def lifespan(app: FastAPI):
     log.info("AGY2API 主服务已停止")
 
 
+class IPWhitelistMiddleware:
+    """
+    IP 白名单中间件（纯 ASGI，覆盖面板与全部 API 路由）
+
+    配置 ip_whitelist 非空时，仅允许命中白名单的客户端 IP 访问，
+    其余请求直接返回 403。白名单为空时不做任何限制（热更新即时生效）。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        import config
+
+        try:
+            enabled, rules = await config.get_ip_whitelist_rules()
+        except Exception as e:
+            # 配置读取失败时放行，避免锁定全部流量
+            log.error(f"读取 IP 白名单配置失败，已放行本次请求: {e}")
+            await self.app(scope, receive, send)
+            return
+
+        if enabled:
+            client_ip = (scope.get("client") or (None, None))[0]
+            if not client_ip or not config.ip_in_whitelist(client_ip, rules):
+                log.warning(f"IP 白名单拦截请求: {client_ip} -> {scope.get('path', '')}")
+                headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope.get("headers", [])}
+                accept = headers.get("accept", "")
+                response: JSONResponse | PlainTextResponse
+                if "application/json" in accept or scope["path"].startswith(("/v1/", "/config/")):
+                    response = JSONResponse(
+                        status_code=403,
+                        content={"error": {"message": "IP not allowed", "code": 403}},
+                    )
+                else:
+                    response = PlainTextResponse("403 Forbidden: IP not allowed", status_code=403)
+                await response(scope, receive, send)
+                return
+
+        await self.app(scope, receive, send)
+
+
 # 创建FastAPI应用
 app = FastAPI(
     title="AGY2API",
@@ -106,6 +145,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# IP 白名单中间件（需在最外层，先于 CORS 与所有路由执行）
+app.add_middleware(IPWhitelistMiddleware)
 
 # 挂载路由器
 # Antigravity路由 - 处理OpenAI格式请求并转换为Antigravity API
