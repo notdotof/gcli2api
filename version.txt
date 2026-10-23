@@ -1,4 +1,4 @@
-full_hash=c597643c1aba49a53493d75734d86bab54f9aae1
-short_hash=c597643
-message=Update antigravity_fix.py
-date=2026-10-16 10:32:23 +0800
+full_hash=7e1bed118577be7f2e66b3c07ab0a3c4d7f37c28
+short_hash=7e1bed1
+message=凭证管理改卡片网格布局
+date=2026-10-23 17:23:51 +0800

@@ -7,7 +7,10 @@ Centralizes all configuration to avoid duplication across modules.
 """
 
 import os
+import re
 from typing import Any, Optional
+
+from log import log
 
 # 全局配置缓存
 _config_cache: dict[str, Any] = {}
@@ -22,7 +25,6 @@ AUTO_BAN_ERROR_CODES = [403]
 # 统一维护环境变量名和配置键名的映射关系
 # 格式: "环境变量名": "配置键名"
 ENV_MAPPINGS = {
-    "CODE_ASSIST_ENDPOINT": "code_assist_endpoint",
     "CREDENTIALS_DIR": "credentials_dir",
     "PROXY": "proxy",
     "OAUTH_PROXY_URL": "oauth_proxy_url",
@@ -36,17 +38,15 @@ ENV_MAPPINGS = {
     "RETRY_429_ENABLED": "retry_429_enabled",
     "RETRY_429_INTERVAL": "retry_429_interval",
     "ANTI_TRUNCATION_MAX_ATTEMPTS": "anti_truncation_max_attempts",
-    "COMPATIBILITY_MODE": "compatibility_mode_enabled",
     "RETURN_THOUGHTS_TO_FRONTEND": "return_thoughts_to_frontend",
-    "ANTIGRAVITY_STREAM2NOSTREAM": "antigravity_stream2nostream",
-    "ANTIGRAVITY_SWITCH_CREDENTIAL": "antigravity_switch_credential_enabled",
+    "SENSITIVE_WORDS": "sensitive_words",
+    "SENSITIVE_WORDS_ENABLED": "sensitive_words_enabled",
+    "USAGE_LOG_ENABLED": "usage_log_enabled",
+    "CREDENTIAL_SELECT_MODE": "credential_select_mode",
     "HOST": "host",
     "PORT": "port",
     "API_PASSWORD": "api_password",
     "PANEL_PASSWORD": "panel_password",
-    "PASSWORD": "password",
-    "KEEPALIVE_URL": "keepalive_url",
-    "KEEPALIVE_INTERVAL": "keepalive_interval",
 }
 
 
@@ -60,9 +60,9 @@ async def init_config():
         return
 
     try:
-        from src.storage_adapter import get_storage_adapter
-        storage_adapter = await get_storage_adapter()
-        _config_cache = await storage_adapter.get_all_config()
+        from src.storage.database import get_database
+        database = await get_database()
+        _config_cache = await database.get_all_config()
         _config_initialized = True
     except Exception:
         # 初始化失败时使用空缓存
@@ -75,15 +75,14 @@ async def reload_config():
     global _config_cache, _config_initialized
 
     try:
-        from src.storage_adapter import get_storage_adapter
-        storage_adapter = await get_storage_adapter()
+        from src.storage.database import get_database
+        database = await get_database()
 
-        # 如果后端支持 reload_config_cache，调用它
-        if hasattr(storage_adapter._backend, 'reload_config_cache'):
-            await storage_adapter._backend.reload_config_cache()
+        # 重新加载数据库配置缓存
+        await database.reload_config_cache()
 
         # 重新加载配置缓存
-        _config_cache = await storage_adapter.get_all_config()
+        _config_cache = await database.get_all_config()
         _config_initialized = True
     except Exception:
         pass
@@ -114,9 +113,23 @@ async def get_config_value(key: str, default: Any = None, env_var: Optional[str]
 
 # Configuration getters - all async
 async def get_proxy_config():
-    """Get proxy configuration."""
+    """Get proxy configuration, validating the URL format.
+
+    Supports http://, https://, socks5://, socks5h:// schemes, all with
+    optional embedded credentials (user:pass@host:port).
+    """
     proxy_url = await get_config_value("proxy", env_var="PROXY")
-    return proxy_url if proxy_url else None
+    if not proxy_url:
+        return None
+
+    proxy_url = proxy_url.strip()
+    scheme = proxy_url.split("://", 1)[0].lower()
+    if scheme not in ("http", "https", "socks5", "socks5h"):
+        log.warning(
+            f"不支持的代理协议: {scheme}://（支持 http/https/socks5/socks5h），已忽略代理"
+        )
+        return None
+    return proxy_url
 
 
 async def get_auto_ban_enabled() -> bool:
@@ -236,15 +249,9 @@ async def get_api_password() -> str:
 
     Environment variable: API_PASSWORD
     Database config key: api_password
-    Default: Uses PASSWORD env var for compatibility, otherwise 'pwd'
+    Default: pwd
     """
-    # 优先使用 API_PASSWORD，如果没有则使用通用 PASSWORD 保证兼容性
-    api_password = await get_config_value("api_password", None, "API_PASSWORD")
-    if api_password is not None:
-        return str(api_password)
-
-    # 兼容性：使用通用密码
-    return str(await get_config_value("password", "pwd", "PASSWORD"))
+    return str(await get_config_value("api_password", "pwd", "API_PASSWORD"))
 
 
 async def get_panel_password() -> str:
@@ -253,26 +260,9 @@ async def get_panel_password() -> str:
 
     Environment variable: PANEL_PASSWORD
     Database config key: panel_password
-    Default: Uses PASSWORD env var for compatibility, otherwise 'pwd'
-    """
-    # 优先使用 PANEL_PASSWORD，如果没有则使用通用 PASSWORD 保证兼容性
-    panel_password = await get_config_value("panel_password", None, "PANEL_PASSWORD")
-    if panel_password is not None:
-        return str(panel_password)
-
-    # 兼容性：使用通用密码
-    return str(await get_config_value("password", "pwd", "PASSWORD"))
-
-
-async def get_server_password() -> str:
-    """
-    Get server password setting (deprecated, use get_api_password or get_panel_password).
-
-    Environment variable: PASSWORD
-    Database config key: password
     Default: pwd
     """
-    return str(await get_config_value("password", "pwd", "PASSWORD"))
+    return str(await get_config_value("panel_password", "pwd", "PANEL_PASSWORD"))
 
 
 async def get_credentials_dir() -> str:
@@ -284,40 +274,6 @@ async def get_credentials_dir() -> str:
     Default: ./creds
     """
     return str(await get_config_value("credentials_dir", "./creds", "CREDENTIALS_DIR"))
-
-
-async def get_code_assist_endpoint() -> str:
-    """
-    Get Code Assist endpoint setting.
-
-    Environment variable: CODE_ASSIST_ENDPOINT
-    Database config key: code_assist_endpoint
-    Default: https://cloudcode-pa.googleapis.com
-    """
-    return str(
-        await get_config_value(
-            "code_assist_endpoint", "https://cloudcode-pa.googleapis.com", "CODE_ASSIST_ENDPOINT"
-        )
-    )
-
-
-async def get_compatibility_mode_enabled() -> bool:
-    """
-    Get compatibility mode setting.
-
-    兼容性模式：启用后所有system消息全部转换成user，停用system_instructions。
-    该选项可能会降低模型理解能力，但是能避免流式空回的情况。
-
-    Environment variable: COMPATIBILITY_MODE
-    Database config key: compatibility_mode_enabled
-    Default: False
-    """
-    env_value = os.getenv("COMPATIBILITY_MODE")
-    if env_value:
-        return env_value.lower() in ("true", "1", "yes", "on")
-
-    return bool(await get_config_value("compatibility_mode_enabled", False))
-
 
 async def get_return_thoughts_to_frontend() -> bool:
     """
@@ -337,40 +293,141 @@ async def get_return_thoughts_to_frontend() -> bool:
     return bool(await get_config_value("return_thoughts_to_frontend", True))
 
 
-async def get_antigravity_stream2nostream() -> bool:
+# ====================== 敏感词过滤 ======================
+
+# 敏感词正则编译缓存: (原始词表指纹, 编译后的 pattern 列表)
+_sensitive_words_cache: dict = {"fingerprint": None, "patterns": []}
+
+
+async def get_sensitive_words_enabled() -> bool:
     """
-    Get use stream for non-stream setting.
+    敏感词过滤开关。
 
-    控制antigravity非流式请求是否使用流式API并收集为完整响应。
-    启用后，非流式请求将在后端使用流式API，然后收集所有块后再返回完整响应。
-
-    Environment variable: ANTIGRAVITY_STREAM2NOSTREAM
-    Database config key: antigravity_stream2nostream
+    Environment variable: SENSITIVE_WORDS_ENABLED
+    Database config key: sensitive_words_enabled
     Default: True
     """
-    env_value = os.getenv("ANTIGRAVITY_STREAM2NOSTREAM")
+    env_value = os.getenv("SENSITIVE_WORDS_ENABLED")
     if env_value:
         return env_value.lower() in ("true", "1", "yes", "on")
 
-    return bool(await get_config_value("antigravity_stream2nostream", True))
+    return bool(await get_config_value("sensitive_words_enabled", True))
 
 
-async def get_antigravity_switch_credential_enabled() -> bool:
+async def get_sensitive_words() -> list:
     """
-    Get antigravity switch credential setting.
+    敏感词列表（支持正则），每行一个；空列表表示不过滤。
 
-    控制antigravity在重试时是否切换凭证。
-    禁用时会持续使用当前凭证，直到该凭证对当前模型进入CD或被禁用。
-
-    Environment variable: ANTIGRAVITY_SWITCH_CREDENTIAL
-    Database config key: antigravity_switch_credential_enabled
-    Default: False
+    Environment variable: SENSITIVE_WORDS (逗号或换行分隔)
+    Database config key: sensitive_words
+    Default: []
     """
-    env_value = os.getenv("ANTIGRAVITY_SWITCH_CREDENTIAL")
+    env_value = os.getenv("SENSITIVE_WORDS")
+    if env_value:
+        words = [w.strip() for w in re.split(r"[,\n]", env_value) if w.strip()]
+        return words
+
+    value = await get_config_value("sensitive_words")
+    if isinstance(value, list):
+        return [str(w) for w in value if str(w).strip()]
+    if isinstance(value, str) and value.strip():
+        return [w.strip() for w in re.split(r"[,\n]", value) if w.strip()]
+    return []
+
+
+def compile_sensitive_words(words: list):
+    """
+    编译敏感词为大小写不敏感的正则列表（带缓存）。
+
+    每个词按字面量转义后编译（用户输入的是词/短语而非正则语法），
+    触发后整词替换为空。支持中文（re.UNICODE 默认开启）。
+
+    Returns:
+        编译后的 Pattern 列表；无效条目跳过并告警。
+    """
+    fingerprint = tuple(words)
+    if _sensitive_words_cache["fingerprint"] == fingerprint:
+        return _sensitive_words_cache["patterns"]
+
+    patterns = []
+    for word in words:
+        word = str(word).strip()
+        if not word:
+            continue
+        try:
+            patterns.append(re.compile(re.escape(word), re.IGNORECASE | re.UNICODE))
+        except re.error as e:
+            log.warning(f"敏感词编译失败，已跳过: {word!r} ({e})")
+
+    _sensitive_words_cache["fingerprint"] = fingerprint
+    _sensitive_words_cache["patterns"] = patterns
+    return patterns
+
+
+def apply_sensitive_word_filter(text: str, patterns) -> str:
+    """将文本中命中的敏感词（大小写不敏感）替换为空"""
+    if not text or not patterns:
+        return text
+    for pattern in patterns:
+        text = pattern.sub("", text)
+    return text
+
+
+async def get_sensitive_word_filter():
+    """
+    获取生效的敏感词过滤条件（供请求处理管道调用）。
+
+    Returns:
+        (enabled, patterns)；未启用时 patterns 为空列表。
+    """
+    if not await get_sensitive_words_enabled():
+        return False, []
+    words = await get_sensitive_words()
+    if not words:
+        return False, []
+    return True, compile_sensitive_words(words)
+
+
+# ====================== 请求日志 ======================
+
+async def get_usage_log_enabled() -> bool:
+    """
+    请求日志（usage_log）开关。
+
+    Environment variable: USAGE_LOG_ENABLED
+    Database config key: usage_log_enabled
+    Default: True
+    """
+    env_value = os.getenv("USAGE_LOG_ENABLED")
     if env_value:
         return env_value.lower() in ("true", "1", "yes", "on")
 
-    return bool(await get_config_value("antigravity_switch_credential_enabled", False))
+    return bool(await get_config_value("usage_log_enabled", True))
+
+
+# ====================== 凭证选择模式 ======================
+
+# 合法的凭证选择模式
+CREDENTIAL_SELECT_MODES = ("random", "cache", "sticky")
+
+
+async def get_credential_select_mode() -> str:
+    """
+    凭证选择模式:
+    - random: 完全随机负载均衡（无亲和）
+    - cache:  会话缓存匹配（默认）——相同会话内容复用同一凭证，命中上游 prompt cache
+    - sticky: 凭证粘性——尽量保持同一凭证直到其进入 CD 或被禁用
+
+    Environment variable: CREDENTIAL_SELECT_MODE
+    Database config key: credential_select_mode
+    Default: cache
+    """
+    value = await get_config_value("credential_select_mode", "cache", "CREDENTIAL_SELECT_MODE")
+    value = str(value).strip().lower()
+    if value not in CREDENTIAL_SELECT_MODES:
+        log.warning(f"无效的凭证选择模式: {value}，回落为 cache")
+        return "cache"
+    return value
 
 
 async def get_oauth_proxy_url() -> str:
@@ -460,37 +517,3 @@ async def get_antigravity_api_url() -> str:
             "ANTIGRAVITY_API_URL",
         )
     )
-
-
-async def get_keepalive_url() -> str:
-    """
-    Get keep-alive URL setting.
-
-    配置后保活服务会定期向该URL发送GET请求。
-    留空表示禁用保活服务。
-
-    Environment variable: KEEPALIVE_URL
-    Database config key: keepalive_url
-    Default: "" (disabled)
-    """
-    return str(await get_config_value("keepalive_url", "", "KEEPALIVE_URL"))
-
-
-async def get_keepalive_interval() -> int:
-    """
-    Get keep-alive interval in seconds.
-
-    保活请求发送间隔（秒）。
-
-    Environment variable: KEEPALIVE_INTERVAL
-    Database config key: keepalive_interval
-    Default: 60
-    """
-    env_value = os.getenv("KEEPALIVE_INTERVAL")
-    if env_value:
-        try:
-            return int(env_value)
-        except ValueError:
-            pass
-
-    return int(await get_config_value("keepalive_interval", 60))

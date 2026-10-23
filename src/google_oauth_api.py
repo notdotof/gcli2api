@@ -565,21 +565,18 @@ async def fetch_project_id_and_tier(
     access_token: str,
     user_agent: str,
     api_base_url: str,
-    include_credits: bool = False,
-) -> Tuple[Optional[str], Optional[str]] | Tuple[Optional[str], Optional[str], Optional[int]]:
+) -> Tuple[Optional[str], Optional[str]]:
     """
     从 API 获取 project_id 和订阅等级
 
     Args:
         access_token: Google OAuth access token
         user_agent: User-Agent header
-        api_base_url: API base URL (e.g., antigravity or code assist endpoint)
+        api_base_url: API base URL (e.g., antigravity endpoint)
 
     Returns:
-        默认返回 (project_id, subscription_tier)
-        当 include_credits=True 时返回 (project_id, subscription_tier, credit_amount)
+        (project_id, subscription_tier)
         subscription_tier 可能是 "FREE", "PRO", "ULTRA" 或 None
-        credit_amount 为积分数量（整数）或 None
     """
     headers = {
         'User-Agent': user_agent,
@@ -595,33 +592,19 @@ async def fetch_project_id_and_tier(
 
         tier_mapping = {
             "g1-ultra-tier": "ultra",
-            "ws-ai-ultra-business-tier": "ultra",
             "g1-pro-tier": "pro",
-            "helium-tier": "pro",
-            "standard-tier": "pro",
+            "standard-tier": "free",
             "free-tier": "free",
         }
 
-        return tier_mapping.get(raw_tier.lower(), "pro")
+        return tier_mapping.get(raw_tier.lower(), "free")
 
     subscription_tier = None
-    credit_amount: Optional[int] = None
 
     # 步骤 1: 尝试 loadCodeAssist
     try:
-        project_id, raw_tier, raw_credit_amount = await _try_load_code_assist(api_base_url, headers)
+        project_id, raw_tier = await _try_load_code_assist(api_base_url, headers)
         subscription_tier = _map_raw_tier(raw_tier)
-
-        if raw_credit_amount is not None:
-            try:
-                credit_amount = int(raw_credit_amount)
-                log.info(
-                    f"[fetch_project_id_and_tier] Found credit_amount: {credit_amount}"
-                )
-            except (TypeError, ValueError):
-                log.warning(
-                    f"[fetch_project_id_and_tier] Invalid credit_amount: {raw_credit_amount}"
-                )
 
         if raw_tier:
             log.info(
@@ -629,49 +612,28 @@ async def fetch_project_id_and_tier(
             )
 
         if project_id:
-            if include_credits:
-                return project_id, subscription_tier, credit_amount
             return project_id, subscription_tier
 
-        log.warning("[fetch_project_id_and_tier] loadCodeAssist did not return project_id, falling back to onboardUser")
+        log.warning("[fetch_project_id_and_tier] loadCodeAssist did not return project_id")
 
     except Exception as e:
         log.warning(f"[fetch_project_id_and_tier] loadCodeAssist failed: {type(e).__name__}: {e}")
-        log.warning("[fetch_project_id_and_tier] Falling back to onboardUser")
 
-    # 步骤 2: 回退到 onboardUser
-    try:
-        project_id = await _try_onboard_user(api_base_url, headers)
-        if project_id:
-            if include_credits:
-                return project_id, subscription_tier, credit_amount
-            return project_id, subscription_tier
-
-        log.error("[fetch_project_id_and_tier] Failed to get project_id from both loadCodeAssist and onboardUser")
-        if include_credits:
-            return None, subscription_tier, credit_amount
-        return None, subscription_tier
-
-    except Exception as e:
-        log.error(f"[fetch_project_id_and_tier] onboardUser failed: {type(e).__name__}: {e}")
-        import traceback
-        log.debug(f"[fetch_project_id_and_tier] Traceback: {traceback.format_exc()}")
-        if include_credits:
-            return None, subscription_tier, credit_amount
-        return None, subscription_tier
+    # 获取失败 -> 使用固定回退值，避免空 project_id 写入数据库
+    log.warning("[fetch_project_id_and_tier] 使用回退 project_id: aicode-consumers")
+    return "aicode-consumers", subscription_tier
 
 
 async def _try_load_code_assist(
     api_base_url: str,
     headers: dict
-) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+) -> Tuple[Optional[str], Optional[str]]:
     """
     尝试通过 loadCodeAssist 获取 project_id 和订阅等级
 
     Returns:
-        (project_id, subscription_tier, credit_amount) 元组
+        (project_id, subscription_tier) 元组
         subscription_tier 可能是 "FREE", "PRO", "ULTRA" 或 None
-        credit_amount 为字符串格式积分或 None
     """
     request_url = f"{api_base_url.rstrip('/')}/v1internal:loadCodeAssist"
     request_body = {
@@ -702,7 +664,6 @@ async def _try_load_code_assist(
         # 提取订阅等级 - 优先使用 paidTier（更准确反映实际权益）
         paid_tier = data.get("paidTier", {})
         current_tier = data.get("currentTier", {})
-        available_credits = paid_tier.get("availableCredits", []) if isinstance(paid_tier, dict) else []
 
         # paidTier.id 优先，然后是 currentTier.id
         subscription_tier = None
@@ -713,15 +674,6 @@ async def _try_load_code_assist(
             subscription_tier = current_tier.get("id")
             log.info(f"[loadCodeAssist] Found currentTier: {subscription_tier}")
 
-        # 提取积分数量（如果返回了 availableCredits）
-        credit_amount = None
-        if isinstance(available_credits, list) and available_credits:
-            first_credit = available_credits[0]
-            if isinstance(first_credit, dict):
-                credit_amount = first_credit.get("creditAmount")
-                if credit_amount is not None:
-                    log.info(f"[loadCodeAssist] Found creditAmount: {credit_amount}")
-
         # 检查是否有 currentTier（表示用户已激活）
         if current_tier:
             log.info("[loadCodeAssist] User is already activated")
@@ -730,153 +682,14 @@ async def _try_load_code_assist(
             project_id = data.get("cloudaicompanionProject")
             if project_id:
                 log.info(f"[loadCodeAssist] Successfully fetched project_id: {project_id}, tier: {subscription_tier}")
-                return project_id, subscription_tier, credit_amount
+                return project_id, subscription_tier
 
             log.warning("[loadCodeAssist] No project_id in response")
-            return None, subscription_tier, credit_amount
+            return None, subscription_tier
         else:
             log.info("[loadCodeAssist] User not activated yet (no currentTier)")
-            return None, None, credit_amount
+            return None, None
     else:
         log.warning(f"[loadCodeAssist] Failed: HTTP {response.status_code}")
         log.warning(f"[loadCodeAssist] Response body: {response.text[:500]}")
         raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
-
-
-async def _try_onboard_user(
-    api_base_url: str,
-    headers: dict
-) -> Optional[str]:
-    """
-    尝试通过 onboardUser 获取 project_id（长时间运行操作，需要轮询）
-
-    Returns:
-        project_id 或 None
-    """
-    request_url = f"{api_base_url.rstrip('/')}/v1internal:onboardUser"
-
-    # 首先需要获取用户的 tier 信息
-    tier_id = await _get_onboard_tier(api_base_url, headers)
-    if not tier_id:
-        log.error("[onboardUser] Failed to determine user tier")
-        return None
-
-    log.info(f"[onboardUser] User tier: {tier_id}")
-
-    # 构造 onboardUser 请求
-    # 注意：FREE tier 不应该包含 cloudaicompanionProject
-    request_body = {
-        "tierId": tier_id,
-        "metadata": {
-            "ideType": "ANTIGRAVITY",
-            "platform": "PLATFORM_UNSPECIFIED",
-            "pluginType": "GEMINI"
-        }
-    }
-
-    log.debug(f"[onboardUser] Request URL: {request_url}")
-    log.debug(f"[onboardUser] Request body: {request_body}")
-
-    # onboardUser 是长时间运行操作，需要轮询
-    # 最多等待 10 秒（5 次 * 2 秒）
-    max_attempts = 5
-    attempt = 0
-
-    while attempt < max_attempts:
-        attempt += 1
-        log.debug(f"[onboardUser] Polling attempt {attempt}/{max_attempts}")
-
-        response = await post_async(
-            request_url,
-            json=request_body,
-            headers=headers,
-            timeout=30.0,
-        )
-
-        log.debug(f"[onboardUser] Response status: {response.status_code}")
-
-        if response.status_code == 200:
-            data = response.json()
-            log.debug(f"[onboardUser] Response data: {data}")
-
-            # 检查长时间运行操作是否完成
-            if data.get("done"):
-                log.info("[onboardUser] Operation completed")
-
-                # 从响应中提取 project_id
-                response_data = data.get("response", {})
-                project_obj = response_data.get("cloudaicompanionProject", {})
-
-                if isinstance(project_obj, dict):
-                    project_id = project_obj.get("id")
-                elif isinstance(project_obj, str):
-                    project_id = project_obj
-                else:
-                    project_id = None
-
-                if project_id:
-                    log.info(f"[onboardUser] Successfully fetched project_id: {project_id}")
-                    return project_id
-                else:
-                    log.warning("[onboardUser] Operation completed but no project_id in response")
-                    return None
-            else:
-                log.debug("[onboardUser] Operation still in progress, waiting 2 seconds...")
-                await asyncio.sleep(2)
-        else:
-            log.warning(f"[onboardUser] Failed: HTTP {response.status_code}")
-            log.warning(f"[onboardUser] Response body: {response.text[:500]}")
-            raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
-
-    log.error("[onboardUser] Timeout: Operation did not complete within 10 seconds")
-    return None
-
-
-async def _get_onboard_tier(
-    api_base_url: str,
-    headers: dict
-) -> Optional[str]:
-    """
-    从 loadCodeAssist 响应中获取用户应该注册的 tier
-
-    Returns:
-        tier_id (如 "FREE", "STANDARD", "LEGACY") 或 None
-    """
-    request_url = f"{api_base_url.rstrip('/')}/v1internal:loadCodeAssist"
-    request_body = {
-        "metadata": {
-            "ideType": "ANTIGRAVITY",
-            "platform": "PLATFORM_UNSPECIFIED",
-            "pluginType": "GEMINI"
-        }
-    }
-
-    log.debug(f"[_get_onboard_tier] Fetching tier info from: {request_url}")
-
-    response = await post_async(
-        request_url,
-        json=request_body,
-        headers=headers,
-        timeout=30.0,
-    )
-
-    if response.status_code == 200:
-        data = response.json()
-        log.debug(f"[_get_onboard_tier] Response data: {data}")
-
-        # 查找默认的 tier
-        allowed_tiers = data.get("allowedTiers", [])
-        for tier in allowed_tiers:
-            if tier.get("isDefault"):
-                tier_id = tier.get("id")
-                log.info(f"[_get_onboard_tier] Found default tier: {tier_id}")
-                return tier_id
-
-        # 如果没有默认 tier，使用 LEGACY 作为回退
-        log.warning("[_get_onboard_tier] No default tier found, using LEGACY")
-        return "LEGACY"
-    else:
-        log.error(f"[_get_onboard_tier] Failed to fetch tier info: HTTP {response.status_code}")
-        return None
-
-

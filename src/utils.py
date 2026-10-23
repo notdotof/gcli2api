@@ -10,28 +10,10 @@ security = HTTPBearer()
 
 # ====================== OAuth Configuration ======================
 
-def get_geminicli_user_agent(model: str = "") -> str:
-    """生成动态 User-Agent: GeminiCLI/{version}/{model} ({platform}; {arch}; {surface})"""
-    if model:
-         return f"Mozilla/5.0 (compatible; Google-Gemini-CLI/1.0; +https://github.com/google-gemini/gemini-cli) {model}"
-    return f"Mozilla/5.0 (compatible; Google-Gemini-CLI/1.0; +https://github.com/google-gemini/gemini-cli)"
-
-# 静态常量
-GEMINICLI_USER_AGENT = get_geminicli_user_agent()
-
 # Antigravity CLI 客户端仿真常量
-ANTIGRAVITY_CLI_VERSION = "1.3.1"
+ANTIGRAVITY_CLI_VERSION = "1.4.5"
 ANTIGRAVITY_CLI_PLATFORM = "windows/amd64"
 ANTIGRAVITY_USER_AGENT = f"antigravity/cli/{ANTIGRAVITY_CLI_VERSION} {ANTIGRAVITY_CLI_PLATFORM}"
-
-# OAuth Configuration - 标准模式
-CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
-CLIENT_SECRET = "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"
-SCOPES = [
-    "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
-]
 
 # Antigravity OAuth Configuration
 ANTIGRAVITY_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
@@ -64,24 +46,20 @@ BASE_MODELS = [
 
 # ====================== Model Helper Functions ======================
 
-def is_fake_streaming_model(model_name: str) -> bool:
-    """Check if model name indicates fake streaming should be used."""
-    return model_name.startswith("假流式/")
+# 抗截断模型前缀
+_ANTI_TRUNCATION_PREFIX = "抗截断-"
 
 
 def is_anti_truncation_model(model_name: str) -> bool:
     """Check if model name indicates anti-truncation should be used."""
-    return model_name.startswith("抗截断/")
+    return model_name.startswith(_ANTI_TRUNCATION_PREFIX)
 
 
 def get_base_model_from_feature_model(model_name: str) -> str:
     """Get base model name from feature model name."""
-    # Remove feature prefixes
-    for prefix in ["假流式/", "抗截断/", "流式抗截断/"]:
-        if model_name.startswith(prefix):
-            return model_name[len(prefix) :]
+    if model_name.startswith(_ANTI_TRUNCATION_PREFIX):
+        return model_name[len(_ANTI_TRUNCATION_PREFIX) :]
     return model_name
-
 
 def get_available_models(router_type: str = "openai") -> List[str]:
     """
@@ -99,11 +77,8 @@ def get_available_models(router_type: str = "openai") -> List[str]:
         # 基础模型
         models.append(base_model)
 
-        # 假流式模型 (前缀格式)
-        models.append(f"假流式/{base_model}")
-
         # 抗截断模型 (前缀格式)
-        models.append(f"抗截断/{base_model}")
+        models.append(f"抗截断-{base_model}")
 
         # 定义思考后缀（根据模型系列不同）
         thinking_suffixes = []
@@ -125,20 +100,17 @@ def get_available_models(router_type: str = "openai") -> List[str]:
         # 1. 单独的 thinking 后缀
         for thinking_suffix in thinking_suffixes:
             models.append(f"{base_model}{thinking_suffix}")
-            models.append(f"假流式/{base_model}{thinking_suffix}")
-            models.append(f"抗截断/{base_model}{thinking_suffix}")
+            models.append(f"抗截断-{base_model}{thinking_suffix}")
 
         # 2. 单独的 search 后缀
         models.append(f"{base_model}{search_suffix}")
-        models.append(f"假流式/{base_model}{search_suffix}")
-        models.append(f"抗截断/{base_model}{search_suffix}")
+        models.append(f"抗截断-{base_model}{search_suffix}")
 
         # 3. thinking + search 组合后缀
         for thinking_suffix in thinking_suffixes:
             combined_suffix = f"{thinking_suffix}{search_suffix}"
             models.append(f"{base_model}{combined_suffix}")
-            models.append(f"假流式/{base_model}{combined_suffix}")
-            models.append(f"抗截断/{base_model}{combined_suffix}")
+            models.append(f"抗截断-{base_model}{combined_suffix}")
 
     return models
 
