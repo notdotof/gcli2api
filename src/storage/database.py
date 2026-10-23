@@ -231,16 +231,43 @@ class Database:
 
     def _create_tables(self, sync_conn) -> None:
         """建表。
-        - 凭证表：结构性变更（键从 filename 变为 email）时删除重建
+        - 凭证表：结构性变更（键从 filename 变为 email）时自动将旧数据迁移至新表
         - 其余表：缺列时用 ALTER TABLE ADD COLUMN 补齐，保留原有数据
         """
         inspector = inspect(sync_conn)
         table_name = AntigravityCredential.__tablename__
+        migrated_rows = []
         if inspector.has_table(table_name):
             existing_columns = {c["name"] for c in inspector.get_columns(table_name)}
-            # 旧结构以 filename 为键、无 email 列 —— 删除重建（数据无法迁移）
+            # 旧结构以 filename 为键、无 email 列 —— 自动迁移旧凭证数据
             if "filename" in existing_columns or "email" not in existing_columns:
-                log.info("检测到旧版凭证表结构（filename 键），重建为 email 键结构")
+                log.info("检测到旧版凭证表结构（filename 键），正在自动迁移旧凭证数据...")
+                try:
+                    cursor = sync_conn.execute(text(f"SELECT filename, credential_data, user_email, disabled, last_success, tier FROM {table_name}"))
+                    for r in cursor.fetchall():
+                        fn, cdata, uemail, dis, ls, tr = r[0], r[1], r[2], r[3], r[4], r[5]
+                        try:
+                            parsed = json.loads(cdata) if isinstance(cdata, str) else (cdata or {})
+                            em = uemail or parsed.get("email") or parsed.get("token", {}).get("email")
+                            if em:
+                                migrated_rows.append({
+                                    "email": em,
+                                    "access_token": parsed.get("access_token") or parsed.get("token", {}).get("access_token", ""),
+                                    "refresh_token": parsed.get("refresh_token") or parsed.get("token", {}).get("refresh_token", ""),
+                                    "client_id": parsed.get("client_id", ""),
+                                    "client_secret": parsed.get("client_secret", ""),
+                                    "project_id": parsed.get("project_id") or parsed.get("token", {}).get("project_id", ""),
+                                    "expiry": str(parsed.get("expiry") or parsed.get("token", {}).get("expiry_timestamp", "")),
+                                    "disabled": bool(dis),
+                                    "last_success": ls,
+                                    "tier": tr or "pro",
+                                    "created_at": time.time(),
+                                    "updated_at": time.time(),
+                                })
+                        except Exception as ex:
+                            log.warning(f"解析旧凭证 {fn} 失败: {ex}")
+                except Exception as e:
+                    log.warning(f"读取旧凭证表失败: {e}")
                 sync_conn.execute(text(f"DROP TABLE {table_name}"))
 
         # 已存在的表补齐缺失列（ALTER TABLE ADD COLUMN，保留数据）
@@ -267,6 +294,21 @@ class Database:
                 log.info(f"表 {table.name} 补充列 {column.name} ({column_type})")
 
         Base.metadata.create_all(sync_conn)
+
+        if migrated_rows:
+            log.info(f"正在将 {len(migrated_rows)} 条旧凭证写入新表...")
+            for item in migrated_rows:
+                try:
+                    sync_conn.execute(
+                        text(f"""
+                            INSERT OR IGNORE INTO {table_name} 
+                            (email, access_token, refresh_token, client_id, client_secret, project_id, expiry, disabled, error_codes, error_messages, last_success, model_cooldowns, tier, created_at, updated_at)
+                            VALUES (:email, :access_token, :refresh_token, :client_id, :client_secret, :project_id, :expiry, :disabled, '[]', '[]', :last_success, '{{}}', :tier, :created_at, :updated_at)
+                        """),
+                        item
+                    )
+                except Exception as e:
+                    log.error(f"迁移凭证 {item.get('email')} 失败: {e}")
 
     async def close(self) -> None:
         if self._engine:
