@@ -1,4 +1,4 @@
-full_hash=73faf5d7733fc046d275d4bfec055d417dce160d
-short_hash=73faf5d
-message=缓存字段读取
-date=2026-10-25 19:54:59 +0800
+full_hash=7720ecf7c0a662abd768ed010d45ab27f7f7a913
+short_hash=7720ecf
+message=清理测试文件
+date=2026-10-26 20:17:28 +0800
