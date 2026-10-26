@@ -37,5 +37,5 @@ COPY . .
 # Expose port
 EXPOSE 7861
 
-# Default command
+# 通过 web.py 启动，使 HOST/PORT 环境变量生效
 CMD ["python", "web.py"]

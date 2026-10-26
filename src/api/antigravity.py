@@ -526,8 +526,11 @@ async def stream_request(
                         success_recorded = True
                         log.debug(f"[ANTIGRAVITY STREAM] 开始接收流式响应，模型: {model_name}")
 
-                    # 从流块中提取 token 用量（通常在最后一个数据块带 usageMetadata）
-                    if not usage_tokens and native is False:
+                    # 从流块中提取 token 用量。
+                    # usageMetadata 可能出现在多个块（首块可能只是部分计数），
+                    # 上游最终计数以最后出现的 usageMetadata 为准（last-wins，
+                    # 对齐 Antigravity-Manager 的流式 usage 聚合行为）
+                    if native is False:
                         from src.usage_log import extract_usage_tokens
 
                         extracted = extract_usage_tokens(chunk)
@@ -588,6 +591,15 @@ async def stream_request(
                     )
                     return
                 continue  # 重试
+
+        except GeneratorExit:
+            # 下游提前关闭了本生成器（转换器断流、抗截断续传、客户端断开等）。
+            # 已收到上游数据却未走到正常收尾时，补记一条成功日志，避免请求
+            # 日志丢失（issue #438）；GeneratorExit 不可吞，必须 re-raise
+            if success_recorded:
+                log.debug("[ANTIGRAVITY STREAM] 生成器被提前关闭，补记成功日志")
+                await _log_stream_result(200, True)
+            raise
 
         except Exception as e:
             log.error(f"[ANTIGRAVITY STREAM] 流式请求异常: {e}, 凭证: {current_file}")
