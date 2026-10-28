@@ -269,7 +269,7 @@ async def refresh_token(
             credential_data["access_token"] = creds.access_token
             credential_data["token"] = creds.access_token
         if creds.expires_at:
-            credential_data["expiry"] = creds.expires_at
+            credential_data["expiry"] = creds.expires_at.isoformat() if hasattr(creds.expires_at, "isoformat") else str(creds.expires_at)
 
         await database.store_credential(email, credential_data)
         log.info(f"Token刷新成功并已保存: {email}")
