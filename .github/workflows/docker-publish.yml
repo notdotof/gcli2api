@@ -12,6 +12,12 @@ on:
       - master
       - main
   workflow_dispatch:
+  workflow_run:
+    workflows: ["Sync Upstream"]
+    types:
+      - completed
+    branches:
+      - master
 
 env:
   REGISTRY: ghcr.io
@@ -20,6 +26,7 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     permissions:
       contents: read
       packages: write
