@@ -69,39 +69,104 @@ def _extract_first_user_text(request_payload: Dict[str, Any]) -> str:
     return ""
 
 
-def _generate_request_id() -> str:
-    """生成完整格式的 requestId，对齐参考实现:
-    agent/{uuid}/{毫秒时间戳}/{trajectory_id}/{step}
+def _generate_request_id(session_id: str, step: int) -> str:
+    """构造官方形态的 requestId：`agent/{conversationId}/{unixMs}/{trajectoryId}/{step}`。
+
+    官方样本（3 份报文逐字核对），例如：
+        agent/a89a2006-72b4-470d-8282-3f1e4c88dc29/1790410048596/d3a2e3d2-21f9-411b-967f-53811898c2cd/14
+
+    - conversationId 段使用 sessionId 的单向哈希派生而非原文，同一会话稳定；
+    - unixMs 段每次请求都不同 → 天然的幂等隔离，避免重试命中上一次的 429 / 旧缓存；
+    - trajectoryId 段每请求唯一，与 unixMs 共同保证幂等隔离。
     """
-    trajectory_id = str(uuid.uuid4())
-    step = 1
-    ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    return f"agent/{uuid.uuid4()}/{ms}/{trajectory_id}/{step}"
+    ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if session_id:
+        conversation = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+    else:
+        conversation = str(uuid.uuid4())
+    trajectory = uuid.uuid4().hex[:8]
+    return f"agent/{conversation}/{ts_ms}/{trajectory}/{step}"
 
 
 def _build_labels(model: str, trajectory_id: str, step: int) -> Dict[str, str]:
-    used_claude = "claude" in model.lower()
+    """构建官方上下文标签元数据（键序按官方字母序排布）。
+
+    官方样本（HAR 抓包）：
+    {
+      "last_step_index": "2",
+      "model_enum": "MODEL_PLACEHOLDER_M320",
+      "request_id": "0917011e-4959-4da9-8554-20499ed72869-2",
+      "trajectory_id": "0917011e-4959-4da9-8554-20499ed72869",
+      "used_claude": "false",
+      "used_claude_conservative": "false",
+      "used_non_gemini_model": "false"
+    }
+    """
+    model_lower = model.lower() if model else ""
+    used_claude = "claude" in model_lower
+    # used_non_gemini_model：Claude / gpt-oss 等非 Gemini 家族模型为 true
+    used_non_gemini = used_claude or "gpt-oss" in model_lower or "grok" in model_lower
     return {
         "last_step_index": str(step),
         "model_enum": model,
+        "request_id": f"{trajectory_id}-{step}",
         "trajectory_id": trajectory_id,
         "used_claude": str(used_claude).lower(),
         "used_claude_conservative": str(used_claude).lower(),
+        "used_non_gemini_model": str(used_non_gemini).lower(),
     }
 
 
+def _has_function_tool(tools: Any) -> bool:
+    """判断 tools 列表中是否存在函数类工具声明。"""
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if isinstance(tool, dict) and (
+            tool.get("functionDeclarations") or tool.get("function_declarations")
+        ):
+            return True
+    return False
+
+
+def _contents_have_tool_interactions(contents: Any) -> bool:
+    """判断 contents 历史中是否存在工具调用上下文。"""
+    if not isinstance(contents, list):
+        return False
+    for content in contents:
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if isinstance(part, dict) and (
+                "functionCall" in part
+                or "function_call" in part
+                or "functionResponse" in part
+                or "function_response" in part
+            ):
+                return True
+    return False
+
+
 def _should_forward_antigravity_header(header_name: str) -> bool:
+    """判断是否向 Antigravity 上游透传该请求头。
+
+    对齐官方 Antigravity Hub 出站请求头（100% 同构）：
+    - 严格过滤 x-session-id / x-client-name / x-client-version / x-machine-id /
+      x-vscode-sessionid 等客户端或前端内部识别标头，规避 WAF 异常标记；
+    - 仅放行官方链路使用的追踪类标头。
+    """
     normalized = header_name.strip().lower()
     if not normalized:
         return False
     if normalized.startswith("x-b3-"):
         return True
     return normalized in {
-        "accept-language",
         "traceparent",
         "tracestate",
         "x-cloud-trace-context",
-        "x-goog-api-client",
         "x-goog-request-params",
         "x-goog-user-project",
         "x-request-id",
@@ -124,8 +189,10 @@ async def wrap_cli_request(
     project_id: str,
 ) -> Tuple[Dict[str, Any], str]:
     """
-    将 Gemini 格式请求包装成 Antigravity CLI 格式。
+    将 Gemini 格式请求包装成 Antigravity CLI 格式（对齐官方 v1internal 信封）。
     返回 (payload, request_id)。
+
+    顶层信封严格遵循官方键序: project -> requestId -> request -> model -> userAgent -> requestType。
     """
     # 浅拷贝 + 只重建需要修改的层（toolConfig/functionCallingConfig），
     # 避免对大 payload（长对话历史）做整体 deepcopy 的热路径开销；
@@ -133,7 +200,7 @@ async def wrap_cli_request(
     inner = dict(gemini_request)
     first_user_text = _extract_first_user_text(inner)
 
-    # 注入 sessionId
+    # 注入 sessionId（会话段使用首个 user 文本哈希派生，同会话稳定利于前缀缓存）
     session_id = str(inner.get("sessionId") or "").strip()
     if not session_id:
         if first_user_text:
@@ -144,28 +211,83 @@ async def wrap_cli_request(
             session_id = f"-{uuid.uuid4().int % 9_000_000_000_000_000_000}"
         inner["sessionId"] = session_id
 
-    # 注入 labels
-    inner["labels"] = _build_labels(model, session_id, 1)
+    # step：以 contents 历史轮次为基准
+    step = 1
+    contents = inner.get("contents")
+    if isinstance(contents, list) and contents:
+        step = max(1, len(contents))
 
-    # toolConfig 默认 VALIDATED（重建这两层，不污染调用方的 dict）
-    src_tool_config = inner.get("toolConfig") or {}
-    src_func_config = src_tool_config.get("functionCallingConfig") or {}
-    func_config = dict(src_func_config)
-    func_config["mode"] = "VALIDATED"
-    tool_config = dict(src_tool_config)
-    tool_config["functionCallingConfig"] = func_config
-    inner["toolConfig"] = tool_config
+    # requestId：官方 5 段形态 agent/{conversationId}/{unixMs}/{trajectoryId}/{step}
+    request_id = _generate_request_id(session_id, step)
+    # trajectory_id 从 requestId 第 4 段提取（与顶层 requestId 严格同步一致）
+    rid_parts = request_id.split("/")
+    trajectory_id = rid_parts[3] if len(rid_parts) >= 5 else str(uuid.uuid4())
 
-    request_id = _generate_request_id()
+    # 注入 labels（last_step_index 即上一步已完成索引 step - 1）
+    inner["labels"] = _build_labels(model, trajectory_id, max(0, step - 1))
+
+    # requestType 与 toolConfig 对齐官方 agent 状态机：
+    # - 常规智能体交互（有 tools 或含工具调用上下文）→ agent；
+    # - 纯文本问答 / 补全 → chat，且绝不携带 tools/toolConfig（避免 Agent 资源池限流）。
+    tools = inner.get("tools")
+    has_tools = _has_function_tool(tools)
+    has_tool_interactions = _contents_have_tool_interactions(inner.get("contents"))
+    is_agent_request = has_tools or has_tool_interactions
+    is_image_request = "image" in (model or "").lower()
+
+    if is_agent_request and not is_image_request:
+        # toolConfig 纯透传：客户端有就传，没有就不传（对齐官方 Antigravity 报文，
+        # 绝不主动注入任何默认 mode），连同 allowedFunctionNames 等字段完整保留。
+        # tools 兜底拆分为官方单函数独立切片形态（上游 normalize 已拆，此为最终出口保证）
+        # 循环依赖，延迟导入
+        from src.converter.antigravity_fix import _split_tools_single_function
+        if isinstance(inner.get("tools"), list):
+            inner["tools"] = _split_tools_single_function(inner["tools"])
+        # 孤立悬挂的 toolConfig（无对应 tools）会引发上游 400 INVALID_ARGUMENT
+        if not has_tools:
+            inner.pop("toolConfig", None)
+    else:
+        # 无工具交互 / 图片生成：剥离客户端可能携带的 tools/toolConfig，对齐官方 chat 报文
+        inner.pop("tools", None)
+        inner.pop("toolConfig", None)
+
+    # 内部 request 拓扑对齐官方键序:
+    # contents -> systemInstruction -> tools -> toolConfig -> labels -> generationConfig -> sessionId -> 其余
+    inner = _align_inner_request_topology(inner)
 
     payload = {
         "project": project_id,
         "requestId": request_id,
         "request": inner,
         "model": model,
-        "requestType": "agent",
+        "userAgent": "antigravity",
+        "requestType": "image_gen" if is_image_request else ("agent" if is_agent_request else "chat"),
     }
     return payload, request_id
+
+
+def _align_inner_request_topology(inner: Dict[str, Any]) -> Dict[str, Any]:
+    """内部 request 严格按官方键序重组:
+    contents -> systemInstruction -> tools -> toolConfig -> labels -> generationConfig -> sessionId -> 其余
+    """
+    key_order = [
+        "contents",
+        "systemInstruction",
+        "tools",
+        "toolConfig",
+        "labels",
+        "generationConfig",
+        "sessionId",
+    ]
+    reordered: Dict[str, Any] = {}
+    for key in key_order:
+        if key in inner:
+            reordered[key] = inner.pop(key)
+    # 其余未知/扩展字段保留在末尾
+    for key, value in inner.items():
+        if key not in reordered:
+            reordered[key] = value
+    return reordered
 
 
 # ==================== 辅助函数 ====================
@@ -175,26 +297,17 @@ def build_antigravity_headers(
     extra_headers: Optional[Dict[str, str]] = None,
     model_name: str = "",
 ) -> Dict[str, str]:
-    """构建 Antigravity CLI API 请求头。"""
+    """构建 Antigravity CLI API 请求头（对齐官方 Hub 出站指纹）。"""
     headers = {
         "User-Agent": ANTIGRAVITY_USER_AGENT,
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
         "Accept": "*/*",
         "Accept-Encoding": "gzip",
-        "Connection": "close",
-        "requestId": f"req-{uuid.uuid4()}",
     }
 
     for key, value in _sanitize_antigravity_headers(extra_headers).items():
         headers.setdefault(key, value)
-
-    # 根据模型名称判断 request_type
-    if model_name:
-        if "image" in model_name.lower():
-            headers["requestType"] = "image_gen"
-        else:
-            headers["requestType"] = "agent"
 
     return headers
 
