@@ -163,6 +163,7 @@ const CONFIG_GROUPS = [
     title: "响应配置",
     fields: [
       { key: "return_thoughts_to_frontend", label: "返回思维链到前端", type: "bool", note: "启用后思维链会在响应中返回；禁用后过滤掉" },
+      { key: "system_instruction_as_user_message", label: "系统指令转为首条 user 消息", type: "bool", note: "启用后，转换时不再使用 systemInstruction 字段，而是将系统指令用 <system-instructions> 标签（XML 格式）包裹后作为第一条 user 消息插入对话开头。保存后立即生效（热更新）" },
     ],
   },
   {

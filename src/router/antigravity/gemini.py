@@ -180,7 +180,7 @@ async def stream_generate_content(
         max_attempts = await get_anti_truncation_max_attempts()
 
         # 首先对payload应用反截断指令
-        anti_truncation_payload = apply_anti_truncation(api_request)
+        anti_truncation_payload = await apply_anti_truncation(api_request)
 
         first_attempt_stream = stream_request(body=anti_truncation_payload, native=False, log_ctx=log_ctx)
         try:

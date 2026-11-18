@@ -1,4 +1,4 @@
-full_hash=3681773e94fcd452453fa0283d1e81342ee82315
-short_hash=3681773
-message=修复多会话场景下上游 KV 缓存频繁失效的问题 (#450)
-date=2026-11-17 19:51:05 +0800
+full_hash=60979cdb36fee7e63769a8b0c062f2f15d6bedbd
+short_hash=60979cd
+message=新增配置项 system_instruction_as_user_message：系统指令转首条 user 消息
+date=2026-11-18 17:54:33 +0800

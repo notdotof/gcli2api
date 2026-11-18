@@ -340,6 +340,7 @@ Import/export uses a standardized JSON format: `{"refresh_token": "...", "access
 
 **Response Behavior Configuration**
 - `RETURN_THOUGHTS_TO_FRONTEND`: Return thinking chain to the frontend (default: true)
+- `SYSTEM_INSTRUCTION_AS_USER_MESSAGE`: Convert the system instruction into the first user message (default: false). When enabled, the systemInstruction field is no longer used during conversion; instead the system instruction is wrapped in a `<system-instructions>` tag (XML format) and inserted as the first user message at the beginning of the conversation. Effective immediately after panel save
 
 **Sensitive Word Filtering**
 - `SENSITIVE_WORDS_ENABLED`: Enable sensitive word filtering (default: false)

@@ -53,6 +53,9 @@ async def get_config(token: str = Depends(verify_panel_token)):
         # 思维链返回配置
         current_config["return_thoughts_to_frontend"] = await config.get_return_thoughts_to_frontend()
 
+        # systemInstruction 转首条 user 消息配置
+        current_config["system_instruction_as_user_message"] = await config.get_system_instruction_as_user_message()
+
         # 敏感词过滤配置
         current_config["sensitive_words_enabled"] = await config.get_sensitive_words_enabled()
         current_config["sensitive_words"] = await config.get_sensitive_words()
@@ -143,6 +146,11 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         if "return_thoughts_to_frontend" in new_config:
             if not isinstance(new_config["return_thoughts_to_frontend"], bool):
                 raise HTTPException(status_code=400, detail="思维链返回开关必须是布尔值")
+
+        # 验证 systemInstruction 转首条 user 消息配置
+        if "system_instruction_as_user_message" in new_config:
+            if not isinstance(new_config["system_instruction_as_user_message"], bool):
+                raise HTTPException(status_code=400, detail="systemInstruction 转首条 user 消息开关必须是布尔值")
 
         # 验证敏感词过滤配置
         if "sensitive_words_enabled" in new_config:

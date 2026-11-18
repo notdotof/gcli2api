@@ -219,6 +219,7 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 
 **响应行为配置**
 - `RETURN_THOUGHTS_TO_FRONTEND`: 返回思维链到前端（默认：true）
+- `SYSTEM_INSTRUCTION_AS_USER_MESSAGE`: 系统指令转为首条 user 消息（默认：false）。启用后转换时不再使用 systemInstruction 字段，而是将系统指令用 `<system-instructions>` 标签（XML 格式）包裹后作为第一条 user 消息插入对话开头。面板保存后立即生效
 
 **敏感词过滤配置**
 - `SENSITIVE_WORDS_ENABLED`: 启用敏感词过滤（默认：false）

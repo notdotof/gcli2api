@@ -20,6 +20,7 @@ from config import (
     get_model_rewrite_filter,
     get_return_thoughts_to_frontend,
     get_sensitive_word_filter,
+    get_system_instruction_as_user_message,
     rewrite_model_name,
 )
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
@@ -930,6 +931,80 @@ def _canonicalize_system_instruction(system_instruction: Dict[str, Any]) -> Dict
     return canonical
 
 
+# systemInstruction 转首条 user 消息时的 XML 包裹标签
+SYSTEM_INSTRUCTIONS_TAG = "system-instructions"
+
+
+def _merge_system_instruction_text(system_instruction: Any) -> str:
+    """提取 systemInstruction 全部 text part，按 part 顺序以换行拼接"""
+    if not isinstance(system_instruction, dict):
+        return ""
+    parts = system_instruction.get("parts")
+    if not isinstance(parts, list):
+        return ""
+    texts = [
+        str(part.get("text"))
+        for part in parts
+        if isinstance(part, dict) and isinstance(part.get("text"), str) and part.get("text").strip()
+    ]
+    return "\n".join(texts)
+
+
+def _convert_system_instruction_to_user_message(
+    result: Dict[str, Any],
+) -> None:
+    """将 systemInstruction 转换为 contents 开头的首条 user 消息（就地修改 result）。
+
+    文本内容用 <system-instructions> 标签（XML 格式）包裹后作为
+    role=user 的 content 插入 contents 最前面，并移除 systemInstruction 字段；
+    非文本 part（如 inlineData）按原顺序保留，不丢弃。
+
+    - 与已有首条 user 消息合并（系统指令 parts 前置），保证 Antigravity
+      上游对相邻同角色消息的兼容性；
+    - contents 缺失时创建仅含该消息的列表；
+    - 系统指令无有效内容时不做任何修改。
+    """
+    system_instruction = result.get("systemInstruction")
+    if not isinstance(system_instruction, dict):
+        return
+    parts = system_instruction.get("parts")
+    if not isinstance(parts, list):
+        return
+
+    system_text = _merge_system_instruction_text(system_instruction)
+    if not system_text:
+        return
+
+    wrapped = f"<{SYSTEM_INSTRUCTIONS_TAG}>\n{system_text}\n</{SYSTEM_INSTRUCTIONS_TAG}>"
+
+    # 文本 part 合并为单个包裹 part，非文本 part（inlineData 等）原样保留
+    system_parts: List[Dict[str, Any]] = [{"text": wrapped}]
+    for part in parts:
+        if isinstance(part, dict) and "text" not in part:
+            system_parts.append(part)
+
+    contents = result.get("contents")
+    if not isinstance(contents, list):
+        contents = []
+    contents = list(contents)
+
+    if (
+        contents
+        and isinstance(contents[0], dict)
+        and contents[0].get("role") == "user"
+        and isinstance(contents[0].get("parts"), list)
+    ):
+        # 与首条 user 消息合并：系统指令 parts 前置
+        first = contents[0]
+        contents[0] = {**first, "parts": system_parts + list(first["parts"])}
+    else:
+        contents.insert(0, {"role": "user", "parts": system_parts})
+
+    result["contents"] = contents
+    result.pop("systemInstruction", None)
+    print("[ANTIGRAVITY] systemInstruction 转换为首条 user 消息（<system-instructions> 包裹）", flush=True)
+
+
 def _enforce_uppercase_schema_types(schema: Any) -> None:
     """递归将 schema 的 type 字段值转为大写（官方 HAR 全工具采用大写类型标记 OBJECT/STRING/...）。
 
@@ -1046,7 +1121,8 @@ async def normalize_antigravity_request(
     3. 模型映射 + thinkingConfig (按 profile.thinking)
     4. contents 清理 -> 预填充处理 -> Claude 专属处理 -> 工具调用 id
     5. 工具 schema 规范化
-    6. 公共参数 (safetySettings / maxOutputTokens / topK)
+    6. systemInstruction 规范化（或转首条 user 消息，面板可配，热更新）
+    7. 公共参数 (safetySettings / maxOutputTokens / topK)
 
     Args:
         request: 原始请求字典 (不会被修改)
@@ -1057,6 +1133,7 @@ async def normalize_antigravity_request(
     model = result.get("model", "")
     generation_config = (result.get("generationConfig") or {}).copy()
     return_thoughts = await get_return_thoughts_to_frontend()
+    system_instruction_as_user = await get_system_instruction_as_user_message()
 
     # ========== 0.5 模型名复写（面板可配，热更新） ==========
     # 在抗截断前缀剥离之后、profile 解析之前应用：
@@ -1123,10 +1200,18 @@ async def normalize_antigravity_request(
     if not isinstance(result.get("systemInstruction"), dict) and isinstance(result.get("system_instruction"), dict):
         # snake_case 键归一化为官方 camelCase
         result["systemInstruction"] = result.pop("system_instruction")
-    if isinstance(result.get("systemInstruction"), dict):
-        result["systemInstruction"] = _canonicalize_system_instruction(result["systemInstruction"])
     # 双写时 camelCase 优先，清除残留的 snake_case 键
     result.pop("system_instruction", None)
+
+    # ========== 4.5 systemInstruction 规范化 / 转首条 user 消息（面板可配，热更新） ==========
+    # 开启转换后：系统指令以 <system-instructions> 标签包裹，作为第一条 user 消息
+    # 插入 contents 开头，systemInstruction 字段不再发往上游；
+    # 转换未生效（无有效文本）或转换关闭时，规范化为官方形态
+    if isinstance(result.get("systemInstruction"), dict):
+        if system_instruction_as_user:
+            _convert_system_instruction_to_user_message(result)
+        if isinstance(result.get("systemInstruction"), dict):
+            result["systemInstruction"] = _canonicalize_system_instruction(result["systemInstruction"])
 
     # ========== 5. thinkingConfig / generationConfig 归一 ==========
     generation_config = _normalize_generation_config(result, generation_config, profile, upstream)

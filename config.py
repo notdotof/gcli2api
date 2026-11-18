@@ -39,6 +39,7 @@ ENV_MAPPINGS = {
     "RETRY_429_INTERVAL": "retry_429_interval",
     "ANTI_TRUNCATION_MAX_ATTEMPTS": "anti_truncation_max_attempts",
     "RETURN_THOUGHTS_TO_FRONTEND": "return_thoughts_to_frontend",
+    "SYSTEM_INSTRUCTION_AS_USER_MESSAGE": "system_instruction_as_user_message",
     "SENSITIVE_WORDS": "sensitive_words",
     "SENSITIVE_WORDS_ENABLED": "sensitive_words_enabled",
     "IP_WHITELIST": "ip_whitelist",
@@ -297,6 +298,25 @@ async def get_return_thoughts_to_frontend() -> bool:
         return env_value.lower() in ("true", "1", "yes", "on")
 
     return bool(await get_config_value("return_thoughts_to_frontend", True))
+
+
+async def get_system_instruction_as_user_message() -> bool:
+    """
+    Get system instruction as user message setting.
+
+    启用后，Antigravity 转换时不再使用 systemInstruction 字段，
+    而是将系统指令用 <system-instructions> 标签（XML 格式）包裹后
+    作为第一条 user 消息插入 contents 开头。
+
+    Environment variable: SYSTEM_INSTRUCTION_AS_USER_MESSAGE
+    Database config key: system_instruction_as_user_message
+    Default: False
+    """
+    env_value = os.getenv("SYSTEM_INSTRUCTION_AS_USER_MESSAGE")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+
+    return bool(await get_config_value("system_instruction_as_user_message", False))
 
 
 # ====================== 敏感词过滤 ======================

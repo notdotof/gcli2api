@@ -18,6 +18,8 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from fastapi import Response as FastAPIResponse
 from fastapi.responses import StreamingResponse
 
+from config import get_system_instruction_as_user_message
+from src.converter.antigravity_fix import SYSTEM_INSTRUCTIONS_TAG
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
 
 # ==================== 合成工具配置 ====================
@@ -107,7 +109,7 @@ def _resolve_function_calling_mode(tools: List[Dict[str, Any]]) -> Tuple[str, bo
     return "AUTO", False
 
 
-def apply_anti_truncation(payload: Dict[str, Any]) -> Dict[str, Any]:
+async def apply_anti_truncation(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     对请求 payload 应用反截断处理：注入合成工具和控制指令
 
@@ -173,21 +175,64 @@ def apply_anti_truncation(payload: Dict[str, Any]) -> Dict[str, Any]:
             flush=True,
         )
 
-    # 3. 注入控制指令到 systemInstruction
-    system_instruction = dict(request_data.get("systemInstruction") or {})
-    if "parts" not in system_instruction:
-        system_instruction["parts"] = []
+    # 3. 注入控制指令：
+    #    - 常规模式：追加到 systemInstruction.parts
+    #    - systemInstruction 转首条 user 消息模式（面板可配）：
+    #      与转换后的系统指令在同一条 user 消息内合并，
+    #      不再重新引入 systemInstruction 字段
+    if await get_system_instruction_as_user_message():
+        contents = [
+            dict(c) if isinstance(c, dict) else c
+            for c in (request_data.get("contents") or [])
+        ]
+        injected_part = {"text": CONTROL_INSTRUCTION}
+        merged = False
+        if contents and isinstance(contents[0], dict) and contents[0].get("role") == "user":
+            first = contents[0]
+            first_parts = [
+                p if isinstance(p, dict) else p
+                for p in (first.get("parts") or [])
+            ]
+            # 定位 <system-instructions> 包裹 part，控制指令紧随其后
+            insert_at = None
+            for idx, part in enumerate(first_parts):
+                if (
+                    isinstance(part, dict)
+                    and isinstance(part.get("text"), str)
+                    and f"<{SYSTEM_INSTRUCTIONS_TAG}>" in part["text"]
+                ):
+                    insert_at = idx + 1
+                    break
+            if insert_at is not None:
+                first["parts"] = first_parts[:insert_at] + [injected_part] + first_parts[insert_at:]
+                merged = True
+        if not merged:
+            # 首条消息不含 <system-instructions>（无系统指令的请求），前置插入
+            if contents and isinstance(contents[0], dict) and contents[0].get("role") == "user":
+                first = contents[0]
+                first["parts"] = [injected_part] + list(first.get("parts") or [])
+            else:
+                contents.insert(0, {"role": "user", "parts": [injected_part]})
+        request_data["contents"] = contents
+        print(
+            "Anti-truncation: 控制指令合并到首条 user 消息（system-instructions 模式）",
+            flush=True,
+        )
     else:
-        # parts 列表可能来自调用方的原始对象，同样拷贝避免原地追加
-        system_instruction["parts"] = list(system_instruction["parts"])
+        system_instruction = dict(request_data.get("systemInstruction") or {})
+        if "parts" not in system_instruction:
+            system_instruction["parts"] = []
+        else:
+            # parts 列表可能来自调用方的原始对象，同样拷贝避免原地追加
+            system_instruction["parts"] = list(system_instruction["parts"])
 
-    has_control_instruction = any(
-        isinstance(part, dict) and SYNTHETIC_TOOL_NAME in part.get("text", "")
-        for part in system_instruction["parts"]
-    )
-    if not has_control_instruction:
-        system_instruction["parts"].append({"text": CONTROL_INSTRUCTION})
-        request_data["systemInstruction"] = system_instruction
+        has_control_instruction = any(
+            isinstance(part, dict) and SYNTHETIC_TOOL_NAME in part.get("text", "")
+            for part in system_instruction["parts"]
+        )
+        if not has_control_instruction:
+            system_instruction["parts"].append({"text": CONTROL_INSTRUCTION})
+            request_data["systemInstruction"] = system_instruction
 
     modified_payload["request"] = request_data
     return modified_payload

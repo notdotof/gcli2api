@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import random
+import ssl
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -25,10 +26,35 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from log import log
+
+
+def _asyncpg_ssl_from_sslmode(sslmode: str, sslrootcert: Optional[str] = None):
+    """将 libpq 风格的 sslmode 值转换为 asyncpg 的 ssl 连接参数。
+
+    asyncpg 的 connect() 不接受 libpq/psycopg2 的 sslmode 关键字；URI 中携带
+    ?sslmode=... 时 SQLAlchemy 会将其原样透传，导致报错：
+    "connect() got an unexpected keyword argument 'sslmode'"。
+    因此必须把 sslmode 从查询串中摘出，转换成 ssl 参数传入。
+    """
+    if sslmode == "disable":
+        return False
+    ctx = ssl.create_default_context()
+    if sslmode in ("require", "prefer", "allow"):
+        # libpq 语义：加密传输但不校验服务端证书
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    elif sslmode == "verify-ca":
+        # 校验证书链但不校验主机名
+        ctx.check_hostname = False
+    # verify-full：保持默认 context（校验证书链 + 主机名）
+    if sslrootcert:
+        ctx.load_verify_locations(cafile=sslrootcert)
+    return ctx
 
 
 # ====================== ORM 模型 ======================
@@ -250,7 +276,30 @@ class Database:
                     dsn = "postgresql+asyncpg://" + dsn[len("postgres://"):]
                 elif not dsn.startswith("postgresql+"):
                     dsn = "postgresql+asyncpg://" + dsn
-                self._engine = create_async_engine(dsn, pool_size=5, max_overflow=5, pool_pre_ping=True)
+
+                engine_kwargs: Dict[str, Any] = {
+                    "pool_size": 5,
+                    "max_overflow": 5,
+                    "pool_pre_ping": True,
+                }
+
+                # asyncpg 不支持 libpq 的 sslmode 查询参数（Aiven/Neon/Supabase
+                # 等云端 PostgreSQL 的 URI 普遍带 ?sslmode=require），需从 URL
+                # 中摘出并转换为 connect_args 的 ssl 参数，否则会抛出
+                # TypeError: connect() got an unexpected keyword argument 'sslmode'
+                url = make_url(dsn)
+                sslmode = url.query.get("sslmode")
+                if sslmode:
+                    query = dict(url.query)
+                    del query["sslmode"]
+                    sslrootcert = query.pop("sslrootcert", None)
+                    url = url.set(query=query)
+                    engine_kwargs["connect_args"] = {
+                        "ssl": _asyncpg_ssl_from_sslmode(sslmode, sslrootcert)
+                    }
+                    log.info(f"POSTGRESQL_URI 的 sslmode={sslmode} 已转换为 asyncpg 的 ssl 连接参数")
+
+                self._engine = create_async_engine(url, **engine_kwargs)
                 self._backend_type = "postgresql"
             else:
                 # SQLite 默认

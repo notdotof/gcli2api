@@ -336,6 +336,7 @@ agy2apiは2つのストレージバックエンドに対応: **ローカルSQLit
 
 **レスポンス動作設定**
 - `RETURN_THOUGHTS_TO_FRONTEND`: 思考チェーンをフロントエンドに返す（デフォルト: true）
+- `SYSTEM_INSTRUCTION_AS_USER_MESSAGE`: システム指示を最初の user メッセージに変換（デフォルト: false）。有効化すると、変換時に systemInstruction フィールドを使用せず、システム指示を `<system-instructions>` タグ（XML 形式）で包んで会話の先頭に最初の user メッセージとして挿入。パネル保存後すぐに有効
 
 **センシティブワードフィルタリング**
 - `SENSITIVE_WORDS_ENABLED`: センシティブワードフィルタリングの有効化（デフォルト: false）
